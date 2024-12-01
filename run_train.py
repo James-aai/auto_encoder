@@ -25,9 +25,10 @@ gpus = [ 0, 1 ]
 # gpus = [0]
 batch_size = 20 #* len(gpus)
 learning_rate = 5e-5
-row_limit = 2500 # data row size
-epochs = 2
+row_limit = 250000 # data row size
+epochs = 10
 WORLD_SIZE = len(gpus) #torch.cuda.device_count()
+embed_dim = 2
 
 os.environ["HF_TOKEN"] = "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"
 
@@ -43,6 +44,8 @@ class Config:
     wandb_name: str | None = "qsxim47qq-ppp"
     data_source_path: str = "/home/james/uni/phd/astro-ph-aic-cpt/data/*.parquet"
     processed_file = "abstracts_gpt2_tokens.pt"
+
+cfg = Config()
 
 def load_tokenizer():
     print("----------Loading tokenizer----------")
@@ -64,8 +67,7 @@ def load_model(rank):
 # useful references:
 # https://github.com/graykode/gpt-2-Pytorch/blob/master/GPT2/model.py
 # https://stackoverflow.com/questions/73593136/typeerror-dropout-argument-input-position-1-must-be-tensor-not-tuple
-cfg = Config()
-embed_dim = 100
+
 
 class AutoEnc(torch.nn.Module):
     def __init__(self, rank):
@@ -87,11 +89,18 @@ class AutoEnc(torch.nn.Module):
 
     def forward(self, input_ids, labels=None, **kwargs):
         output = self.encoder_0(input_ids)[0]
+        local_batch_size = input_ids.shape[0]
         # output = self.encoder_1(output)
         output = self.embed_0(output)
+        # output = output.view([local_batch_size,-1])[:,0:embed_dim]
+        embed_mask_ones = torch.ones(output.shape[1], embed_dim)
+        embed_mask_zeros = torch.zeros(output.shape[1], output.shape[2] - embed_dim)
+        embed_mask = torch.cat((embed_mask_ones, embed_mask_zeros), 0)
+        output = output * embed_mask
         output = self.embed_1(output)
+        print(torch.count_nonzero(output))
         # output = torch.topk()
-        # output = self.decoder_0(output)
+        output = torch.unsqueeze(output, 1)
         for block in self.decoder_0_list:
             output = block(output, layer_past=None)[0]
         output = self.decoder_1(output)
@@ -175,11 +184,14 @@ def test_example(model, text):
     tokenizer = load_tokenizer()
     if type(text) == 'str':
         encoded_input = tokenizer(text, return_tensors='pt').to(device)
+        output = model(**encoded_input).to(device)
     else:
         encoded_input = text['input_ids'].to(device)
-    output = model(**encoded_input).to(device)
+        encoded_input = torch.unsqueeze(encoded_input, 0)
+        output = model(encoded_input).to(device)
+        text = tokenizer.decode(text['input_ids'], skip_special_tokens=True)
     output_ids = [torch.argmax(x).item() for x in output.squeeze()]
-    result = tokenizer.decode(output_ids)
+    result = tokenizer.decode(output_ids, skip_special_tokens=True)
 
     print("Input:\n", text)
     print("output:\n", result)
