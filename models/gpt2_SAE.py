@@ -24,7 +24,7 @@ def load_tokenizer():
 
 class SparseAutoEnc(torch.nn.Module):
     def __init__(self, rank, sequence_token_length, embed_dim, sparsity_k):
-        super(AutoEnc, self).__init__()
+        super(SparseAutoEnc, self).__init__()
         self.k = sparsity_k
         enc_model = self._load_model(rank)
         self.encoder_0 = list(enc_model.children())[0].to(device=rank)
