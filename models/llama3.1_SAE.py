@@ -4,11 +4,11 @@ import torch
 # model_id = "facebook/opt-350m"
 # model_id = "facebook/opt-6.7b"
 # model_id = "facebook/opt-2.7b"
-# model_id = "meta-llama/Meta-Llama-3.1-8B"
+model_id = "meta-llama/Meta-Llama-3.1-8B"
 # model_id = "meta-llama/Meta-Llama-3-8B-Instruct"
 # model_id = '/scratch/dg97/jm6832/Meta-Llama-3.1-8B/' # for local model
 # model_id = "/scratch/dg97/jm6832/hf_home/hub/models--meta-llama--Meta-Llama-3.1-8B/snapshots/48d6d0fc4e02fb1269b36940650a1b7233035cbb"
-model_id = "openai-community/gpt2"
+# model_id = "openai-community/gpt2"
 local_files_only=False
 
 # useful references:

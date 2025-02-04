@@ -7,33 +7,34 @@ import pandas as pd
 # from models import gpt2_autoenc as model_def ## non-sparse
 from models import gpt2_SAE as model_def
 
-os.environ["CUDA_VISIBLE_DEVICES"]="0,1"
-# os.environ["CUDA_VISIBLE_DEVICES"]="0"
+# os.environ["CUDA_VISIBLE_DEVICES"]="0,1"
+os.environ["CUDA_VISIBLE_DEVICES"]="1"
 os.environ["CUDA_LAUNCH_BLOCKING"]="1"
 os.environ["TOKENIZERS_PARALLELISM"]="true"
 os.environ["HF_TOKEN"] = "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"
 
-gpus = [ 0 ] #, 1 ]
+gpus = [ 0 ]
 multi_gpu = (len(gpus) > 1)
-batch_size = 16 # * len(gpus)
+batch_size = 10 * len(gpus)
 learning_rate = 5e-5
-row_limit = 256000 # data row size
+row_limit = 25600 # data row size
 epochs = 10
+epoch_start = 0
 WORLD_SIZE = len(gpus) #torch.cuda.device_count()
-embed_dim = 5000
+embed_dim = 1000
 sparsity_k = 100
-sequence_token_length = 300
+sequence_token_length = 100
 load_checkpoint = False
 
-print( "GPUs Available: ", len(gpus)
-    # [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())],
+print( "GPUs Available: ", len(gpus),
+    [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())],
 )
 
 @dataclass
 class Config:
     wandb_project: str | None = "autoencoder-gpt2"
     wandb_name: str | None = "qsxim47qq-ppp"
-    data_source_path: str = "/home/james/uni/phd/astro-ph-aic-cpt/data/*.parquet"
+    data_source_path: str = ("d:/@" if os.name == "nt" else "/") + "home/james/uni/phd/astro-ph-aic-cpt/data/*.parquet"
     processed_file = "abstracts_gpt2_tokens.pt"
 
 cfg = Config()
@@ -51,6 +52,8 @@ def load_data():
     ## dataloading is left as an exercise for the reader
     print("--- loading data from parquet files start... ---")
     filelist = glob.glob(cfg.data_source_path)
+    assert len(filelist) > 0
+    filelist = [x.replace("\\", "/") for x in filelist]
     df = pd.read_parquet(filelist).head(row_limit if row_limit is not None else -1)
     df['text'] = df['text'].astype('str')
     df['text'] = df['text'].str.slice(0,sequence_token_length * 5)
@@ -103,14 +106,17 @@ def test_example(model, text):
         encoded_input = text['input_ids'].to(gpus[0])
         encoded_input = torch.unsqueeze(encoded_input, 0)
         output = model(encoded_input).to(gpus[0])
-        print(f"test output shape: {output.shape}")
         text = tokenizer.decode(text['input_ids'], skip_special_tokens=True)
     output_ids = [torch.argmax(x).item() for x in output.squeeze()]
     result = tokenizer.decode(output_ids, skip_special_tokens=True)
 
-    print("Input:\n", text)
-    print("output:\n", result)
     model.train()
+    return result, text
+
+def test_example_print(model, text_ids):
+    result, text_str = test_example(model, text_ids)
+    print(f"Input: {text_str}")
+    print(f"Result: {result}")
 
 
 from tqdm import tqdm
@@ -146,10 +152,10 @@ def main(rank, train_dataset, test_dataset):
     # model = model_def.AutoEnc(rank, sequence_token_length, embed_dim)
     model = model_def.SparseAutoEnc(rank, sequence_token_length, embed_dim, sparsity_k)
     optim = AdamW(model.parameters(), lr=learning_rate)
-    epoch_start = 11
+    epoch_start = 1
 
     if load_checkpoint:
-        checkpoint = torch.load("./checkpoints/autoEnc_gpt2_11_epochs.pt", weights_only=True)
+        checkpoint = torch.load("./checkpoints/SparseAutoEnc_gpt2_100_tokens.pt", weights_only=True)
         model.load_state_dict(checkpoint['model_state_dict'])
         optim.load_state_dict(checkpoint['optimizer_state_dict'])
         epoch_start = checkpoint['epoch']
@@ -158,14 +164,17 @@ def main(rank, train_dataset, test_dataset):
     torch.cuda.set_device(rank)
     model.train()
 
-
-    # from torcheval.metrics import WordErrorRate
-    # metric = WordErrorRate(device=rank)
+    # validation metric
+    from torcheval.metrics import WordErrorRate
+    val_metric = WordErrorRate(device=rank)
 
     if multi_gpu:
         os.environ['MASTER_ADDR'] = 'localhost'
         os.environ['MASTER_PORT'] = '12355'
-        torch.distributed.init_process_group("nccl", rank=rank, world_size=WORLD_SIZE)
+        torch.distributed.init_process_group(
+            backend = "gloo" if os.name == "nt" or not torch.cuda.is_available() else "nccl",
+            rank=rank, world_size=WORLD_SIZE,
+            init_method = "env://?use_libuv=False" if os.name == "nt" else "env://")
 
         sampler_train = DistributedSampler(train_dataset)
         model = torch.nn.parallel.DistributedDataParallel(model, [rank])
@@ -184,7 +193,7 @@ def main(rank, train_dataset, test_dataset):
         # with profile(activities=[ProfilerActivity.CUDA], record_shapes=True) as prof:
         with torch.profiler.profile(
                 schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=1),
-                on_trace_ready=torch.profiler.tensorboard_trace_handler('./log/gpt2_autoenc'),
+                on_trace_ready=torch.profiler.tensorboard_trace_handler('./log/gpt2_sparseautoenc'),
                 record_shapes=True,
                 profile_memory=True,
                 with_stack=True
@@ -219,7 +228,16 @@ def main(rank, train_dataset, test_dataset):
 
         # Epoch finish up steps
         if rank==0:
-            test_example(model, text=test_dataset[0])
+            test_example_print(model, text_ids=test_dataset[0])
+            test_example_print(model, text_ids=test_dataset[1])
+            test_example_print(model, text_ids=test_dataset[2])
+            test_example_print(model, text_ids=test_dataset[3])
+            for i in range(0,min(len(test_dataset), 30)):
+                result, target = test_example(model, test_dataset[i])
+                val_metric.update(input=result, target=target)
+
+            print(f"Word Error rate = {val_metric.compute()}")
+
             # print(prof.key_averages(group_by_input_shape=True).table()) #sort_by="cpu_time_total", row_limit=10))
             # prof.export_chrome_trace("~/chrom.trace")
             # print(prof.key_averages(group_by_input_shape=True).table(sort_by="cuda_time_total", row_limit=10))
@@ -230,7 +248,7 @@ def main(rank, train_dataset, test_dataset):
                         'model_state_dict': model.state_dict(),
                         'optimizer_state_dict': optim.state_dict(),
                         'loss': loss.sum(),
-                        }, f"./checkpoints/autoEnc_gpt2_{epoch}_epochs.pt")
+                        }, f"./checkpoints/SparseAutoEnc_gpt2_{epoch}_epochs.pt")
 
     if multi_gpu:
         torch.distributed.destroy_process_group()
@@ -241,7 +259,10 @@ if __name__ == '__main__':
     print("--- Main thread. World Size: ", WORLD_SIZE)
     prompts = load_data()
     train_dataset, test_dataset = prep_data(prompts)
-    mp.spawn(main, args=(train_dataset, test_dataset), nprocs=WORLD_SIZE) #, join=True)
+    if WORLD_SIZE > 1:
+        mp.spawn(main, args=(train_dataset, test_dataset), nprocs=WORLD_SIZE) #, join=True)
+    else:
+        main(0, train_dataset, test_dataset)
 
 
 # prompts = load_data()
