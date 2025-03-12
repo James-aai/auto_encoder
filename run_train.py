@@ -5,17 +5,18 @@ from dataclasses import dataclass
 import os
 import pandas as pd
 # from models import gpt2_autoenc as model_def ## non-sparse
-from models import gpt2_SAE as model_def
+from models import llama3_1_SAE as model_def
 
-# os.environ["CUDA_VISIBLE_DEVICES"]="0,1"
-os.environ["CUDA_VISIBLE_DEVICES"]="1"
+os.environ["CUDA_VISIBLE_DEVICES"]="0,1"
+# os.environ["CUDA_VISIBLE_DEVICES"]="1"
 os.environ["CUDA_LAUNCH_BLOCKING"]="1"
 os.environ["TOKENIZERS_PARALLELISM"]="true"
 os.environ["HF_TOKEN"] = "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"
 
+model_name = model_def.model_id.split('/')[-1]
 gpus = [ 0 ]
 multi_gpu = (len(gpus) > 1)
-batch_size = 10 * len(gpus)
+batch_size = 1 * len(gpus)
 learning_rate = 5e-5
 row_limit = 25600 # data row size
 epochs = 10
@@ -32,10 +33,10 @@ print( "GPUs Available: ", len(gpus),
 
 @dataclass
 class Config:
-    wandb_project: str | None = "autoencoder-gpt2"
+    wandb_project: str | None = "autoencoder-" + model_name
     wandb_name: str | None = "qsxim47qq-ppp"
     data_source_path: str = ("d:/@" if os.name == "nt" else "/") + "home/james/uni/phd/astro-ph-aic-cpt/data/*.parquet"
-    processed_file = "abstracts_gpt2_tokens.pt"
+    processed_file = "abstracts_tokens_" + model_name + ".pt"
 
 cfg = Config()
 
@@ -142,76 +143,83 @@ def progress_bar(iterable, **kwargs):
 
 def main(rank, train_dataset, test_dataset):
     # rank = gpus[rank]
-    print("----training process started on GPU: ", rank)
+    print(f"----training process started for model {model_name} on GPU: {rank}")
     import torch
     from torch.utils.data import DataLoader
     from torch.optim import AdamW
     from torch.utils.data.distributed import DistributedSampler
     from torch.profiler import profile, record_function, ProfilerActivity
 
-    # model = model_def.AutoEnc(rank, sequence_token_length, embed_dim)
-    model = model_def.SparseAutoEnc(rank, sequence_token_length, embed_dim, sparsity_k)
-    optim = AdamW(model.parameters(), lr=learning_rate)
-    epoch_start = 1
+    with torch.profiler.profile(
+            schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=1),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(F'./log/{model_name}_sparseautoenc'),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True
+    ) as prof:
 
-    if load_checkpoint:
-        checkpoint = torch.load("./checkpoints/SparseAutoEnc_gpt2_100_tokens.pt", weights_only=True)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optim.load_state_dict(checkpoint['optimizer_state_dict'])
-        epoch_start = checkpoint['epoch']
-        loss = checkpoint['loss']
+        # model = model_def.AutoEnc(rank, sequence_token_length, embed_dim)
+        model = model_def.SparseAutoEnc(rank, sequence_token_length, embed_dim, sparsity_k)
+        # optim = AdamW(model.parameters(), lr=learning_rate)
+        optim = torch.optim.SGD(model.parameters(), lr=learning_rate)
+        epoch_start = 1
 
-    torch.cuda.set_device(rank)
-    model.train()
+        if load_checkpoint:
+            checkpoint = torch.load(f"./checkpoints/SparseAutoEnc_{model_name}_tokens_{sequence_token_length}.pt", weights_only=True)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            optim.load_state_dict(checkpoint['optimizer_state_dict'])
+            epoch_start = checkpoint['epoch']
+            loss = checkpoint['loss']
 
-    # validation metric
-    from torcheval.metrics import WordErrorRate
-    val_metric = WordErrorRate(device=rank)
+        torch.cuda.set_device(rank)
+        model.train()
 
-    if multi_gpu:
-        os.environ['MASTER_ADDR'] = 'localhost'
-        os.environ['MASTER_PORT'] = '12355'
-        torch.distributed.init_process_group(
-            backend = "gloo" if os.name == "nt" or not torch.cuda.is_available() else "nccl",
-            rank=rank, world_size=WORLD_SIZE,
-            init_method = "env://?use_libuv=False" if os.name == "nt" else "env://")
+        # validation metric
+        from torcheval.metrics import WordErrorRate
+        val_metric = WordErrorRate(device=rank)
 
-        sampler_train = DistributedSampler(train_dataset)
-        model = torch.nn.parallel.DistributedDataParallel(model, [rank])
-    else:
-        sampler_train = torch.utils.data.RandomSampler(train_dataset)
-
-    train_loader = DataLoader(
-        train_dataset, batch_size=batch_size, shuffle=False, sampler=sampler_train, num_workers=1
-    )
-
-
-    for epoch in range(epoch_start, epoch_start + epochs):
-        print("Starting epoch: ", epoch)
         if multi_gpu:
-            sampler_train.set_epoch(epoch)
-        # with profile(activities=[ProfilerActivity.CUDA], record_shapes=True) as prof:
-        with torch.profiler.profile(
-                schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=1),
-                on_trace_ready=torch.profiler.tensorboard_trace_handler('./log/gpt2_sparseautoenc'),
-                record_shapes=True,
-                profile_memory=True,
-                with_stack=True
-        ) as prof:
+            os.environ['MASTER_ADDR'] = 'localhost'
+            os.environ['MASTER_PORT'] = '12355'
+            torch.distributed.init_process_group(
+                backend = "gloo" if os.name == "nt" or not torch.cuda.is_available() else "nccl",
+                rank=rank, world_size=WORLD_SIZE,
+                init_method = "env://?use_libuv=False" if os.name == "nt" else "env://")
+
+            sampler_train = DistributedSampler(train_dataset)
+            model = torch.nn.parallel.DistributedDataParallel(model, [rank])
+        else:
+            sampler_train = torch.utils.data.RandomSampler(train_dataset)
+
+        train_loader = DataLoader(
+            train_dataset, batch_size=batch_size, shuffle=False, sampler=sampler_train, num_workers=1
+        )
+        # only needed for memory debugging - turn off for regular use
+        # torch.cuda.memory._record_memory_history()
+
+        for epoch in range(epoch_start, epoch_start + epochs):
+            print("Starting epoch: ", epoch)
+            if multi_gpu:
+                sampler_train.set_epoch(epoch)
+            # with profile(activities=[ProfilerActivity.CUDA], record_shapes=True) as prof:
+
             with progress_bar(train_loader) as batches:
                 batches.set_description(f"Epoch {epoch}")
                 for batch in batches:
                     prof.step()
+                    # with torch.amp.autocast(device_type="cuda"):
                     with record_function("data_loading"):
                         input_ids = batch['input_ids'].to(rank)
                         attention_mask = batch['attention_mask'].to(rank)
                         labels = batch['labels'].to(rank)
                     # forward pass
                     with record_function("forward_pass"):
-                        outputs = model(input_ids, attention_mask=attention_mask, labels=labels)
+                            outputs = model(input_ids, attention_mask=attention_mask, labels=labels)
+
+                    torch.cuda.memory._dump_snapshot("my_snapshot.pickle")
 
                     with record_function("backward_pass"):
-                        loss = outputs
+                        loss = outputs #.cpu()
                         optim.zero_grad()
                         loss.sum().backward()
                         # update weights
@@ -248,7 +256,7 @@ def main(rank, train_dataset, test_dataset):
                         'model_state_dict': model.state_dict(),
                         'optimizer_state_dict': optim.state_dict(),
                         'loss': loss.sum(),
-                        }, f"./checkpoints/SparseAutoEnc_gpt2_{epoch}_epochs.pt")
+                        }, f"./checkpoints/SparseAutoEnc_{model_name}_epochs_{epoch}.pt")
 
     if multi_gpu:
         torch.distributed.destroy_process_group()
