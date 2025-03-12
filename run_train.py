@@ -162,7 +162,7 @@ def main(rank, train_dataset, test_dataset):
         model = model_def.SparseAutoEnc(rank, sequence_token_length, embed_dim, sparsity_k)
         # optim = AdamW(model.parameters(), lr=learning_rate)
         optim = torch.optim.SGD(model.parameters(), lr=learning_rate)
-        epoch_start = 1
+        epoch_start = 0
 
         if load_checkpoint:
             checkpoint = torch.load(f"./checkpoints/SparseAutoEnc_{model_name}_tokens_{sequence_token_length}.pt", weights_only=True)
