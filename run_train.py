@@ -18,7 +18,7 @@ gpus = [ 0 ]
 multi_gpu = (len(gpus) > 1)
 batch_size = 1 * len(gpus)
 learning_rate = 5e-5
-row_limit = 25600 # data row size
+row_limit = 256000 # data row size
 epochs = 10
 epoch_start = 0
 WORLD_SIZE = len(gpus) #torch.cuda.device_count()
@@ -234,29 +234,29 @@ def main(rank, train_dataset, test_dataset):
                             # acc=float(acc)
                         )
 
-        # Epoch finish up steps
-        if rank==0:
-            test_example_print(model, text_ids=test_dataset[0])
-            test_example_print(model, text_ids=test_dataset[1])
-            test_example_print(model, text_ids=test_dataset[2])
-            test_example_print(model, text_ids=test_dataset[3])
-            for i in range(0,min(len(test_dataset), 30)):
-                result, target = test_example(model, test_dataset[i])
-                val_metric.update(input=result, target=target)
+            # Epoch finish up steps
+            if rank==0:
+                test_example_print(model, text_ids=test_dataset[0])
+                test_example_print(model, text_ids=test_dataset[1])
+                test_example_print(model, text_ids=test_dataset[2])
+                test_example_print(model, text_ids=test_dataset[3])
+                for i in range(0,min(len(test_dataset), 30)):
+                    result, target = test_example(model, test_dataset[i])
+                    val_metric.update(input=result, target=target)
 
-            print(f"Word Error rate = {val_metric.compute()}")
+                print(f"Word Error rate = {val_metric.compute()}")
 
-            # print(prof.key_averages(group_by_input_shape=True).table()) #sort_by="cpu_time_total", row_limit=10))
-            # prof.export_chrome_trace("~/chrom.trace")
-            # print(prof.key_averages(group_by_input_shape=True).table(sort_by="cuda_time_total", row_limit=10))
+                # print(prof.key_averages(group_by_input_shape=True).table()) #sort_by="cpu_time_total", row_limit=10))
+                # prof.export_chrome_trace("~/chrom.trace")
+                # print(prof.key_averages(group_by_input_shape=True).table(sort_by="cuda_time_total", row_limit=10))
 
-            print("Saving model... ")
-            torch.save({
-                        'epoch': epochs,
-                        'model_state_dict': model.state_dict(),
-                        'optimizer_state_dict': optim.state_dict(),
-                        'loss': loss.sum(),
-                        }, f"./checkpoints/SparseAutoEnc_{model_name}_epochs_{epoch}.pt")
+                print("Saving model... ")
+                torch.save({
+                            'epoch': epochs,
+                            'model_state_dict': model.state_dict(),
+                            'optimizer_state_dict': optim.state_dict(),
+                            'loss': loss.sum(),
+                            }, f"./checkpoints/SparseAutoEnc_{model_name}_epochs_{epoch}.pt")
 
     if multi_gpu:
         torch.distributed.destroy_process_group()
