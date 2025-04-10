@@ -31,7 +31,8 @@ class SparseAutoEnc(torch.nn.Module):
         self.logit_dim = 3072  # 768 for GPT-2, 3072 for Llama 3.2
         self.sparse_act = torch.nn.ReLU()
         self.device_main = torch.device(f"cuda:{rank}")
-        self.device_aux = torch.device("cuda:1")
+        # self.device_aux = torch.device("cuda:1")
+        self.device_aux = self.device_main
 
         enc_model = self._load_model(rank)
         self.encoder_0 = list(enc_model.children())[0].to(self.device_main)
@@ -44,7 +45,7 @@ class SparseAutoEnc(torch.nn.Module):
             in_features=embed_dim, out_features=self.logit_dim * sequence_token_length, dtype=torch.float16
         ).to(self.device_aux)
 
-        dec_model = self._load_model(1)
+        dec_model = self._load_model(self.device_aux)
         decoder_embedding_layers_to_drop = 1
         self.decoder_0_list = list(list(dec_model.children())[0].children())[decoder_embedding_layers_to_drop].to(
             self.device_aux)
@@ -59,7 +60,8 @@ class SparseAutoEnc(torch.nn.Module):
         output = output.view(local_batch_size, -1)
         output = self.embed_0(output).to(self.device_main)
 
-        output = output.cpu().to(self.device_aux)
+        if self.device_aux != self.device_main:
+            output = output.cpu().to(self.device_aux)
 
         output = self._sparsify(output)
         output = self.embed_1(output) ### why is this producing NaN ???
@@ -76,7 +78,9 @@ class SparseAutoEnc(torch.nn.Module):
 
         if labels is not None:
             loss_fct = torch.nn.CrossEntropyLoss(ignore_index=-1)
-            labels = labels.view(-1).cpu().to(dtype=torch.long, device=self.device_aux)
+            labels = labels.view(-1)
+            if self.device_aux != self.device_main:
+                labels = labels.cpu().to(dtype=torch.long, device=self.device_aux)
             output = output.view(-1, output.size(-1))
             loss = loss_fct(output, labels)
 
