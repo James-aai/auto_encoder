@@ -6,6 +6,8 @@ import os
 import pandas as pd
 # from models import gpt2_autoenc as model_def ## non-sparse
 from models import llama3_1_SAE as model_def
+import wandb
+import pathlib
 
 os.environ["CUDA_VISIBLE_DEVICES"]="0,1"
 # os.environ["CUDA_VISIBLE_DEVICES"]="1"
@@ -16,7 +18,7 @@ os.environ["HF_TOKEN"] = "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"
 model_name = model_def.model_id.split('/')[-1]
 gpus = [ 0 ]
 multi_gpu = (len(gpus) > 1)
-batch_size = 1 * len(gpus)
+# batch_size = 1 * len(gpus)
 learning_rate = 5e-5
 row_limit = 256000 # data row size
 epochs = 10
@@ -33,10 +35,11 @@ print( "GPUs Available: ", len(gpus),
 
 @dataclass
 class Config:
-    wandb_project: str | None = "autoencoder-" + model_name
+    wandb_project: str | None = "sparse-autoencoder-" + model_name + "-" + str(embed_dim) + "-" + str(sparsity_k)
     wandb_name: str | None = "qsxim47qq-ppp"
-    data_source_path: str = ("d:/@" if os.name == "nt" else "/") + "home/james/uni/phd/astro-ph-aic-cpt/data/*.parquet"
-    processed_file = "abstracts_tokens_" + model_name + ".pt"
+    # data_source_path: str = ("d:/@" if os.name == "nt" else "/") + "home/james/uni/phd/astro-ph-aic-cpt/data/*.parquet"
+    data_source_path: str = "/home/659/jm6832/data/astro-ph-aic-cpt/data"
+    processed_file: str = "abstracts_tokens_" + model_name + ".pt"
 
 cfg = Config()
 
@@ -141,7 +144,8 @@ def progress_bar(iterable, **kwargs):
     ))
 
 
-def main(rank, train_dataset, test_dataset):
+
+def main(rank, batch_size, train_dataset, test_dataset):
     # rank = gpus[rank]
     print(f"----training process started for model {model_name} on GPU: {rank}")
     import torch
@@ -149,6 +153,29 @@ def main(rank, train_dataset, test_dataset):
     from torch.optim import AdamW
     from torch.utils.data.distributed import DistributedSampler
     from torch.profiler import profile, record_function, ProfilerActivity
+
+
+    class Logger:
+        def __init__(self, **kws):
+            self.vals = {}
+            self.enabled = (rank == 0) and not kws.pop("dummy", False)
+            if self.enabled:
+                wandb.init(
+                    **kws
+                )
+    
+        def logkv(self, k, v):
+            if self.enabled:
+                self.vals[k] = v.detach() if isinstance(v, torch.Tensor) else v
+            return v
+    
+        def dumpkvs(self):
+            if self.enabled:
+                wandb.log(self.vals)
+                self.vals = {}
+
+    #if logger is None:
+    logger = Logger(project=f"sparse-autoenc-{model_name}-emb-{embed_dim}-k-{sparsity_k}")
 
     with torch.profiler.profile(
             schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=1),
@@ -192,7 +219,7 @@ def main(rank, train_dataset, test_dataset):
             sampler_train = torch.utils.data.RandomSampler(train_dataset)
 
         train_loader = DataLoader(
-            train_dataset, batch_size=batch_size, shuffle=False, sampler=sampler_train, num_workers=1
+            train_dataset, batch_size=(batch_size * WORLD_SIZE), shuffle=False, sampler=sampler_train, num_workers=1
         )
         # only needed for memory debugging - turn off for regular use
         # torch.cuda.memory._record_memory_history()
@@ -216,7 +243,7 @@ def main(rank, train_dataset, test_dataset):
                     with record_function("forward_pass"):
                             outputs = model(input_ids, attention_mask=attention_mask, labels=labels)
 
-                    torch.cuda.memory._dump_snapshot("my_snapshot.pickle")
+                    # torch.cuda.memory._dump_snapshot("my_snapshot.pickle")
 
                     with record_function("backward_pass"):
                         loss = outputs #.cpu()
@@ -224,6 +251,7 @@ def main(rank, train_dataset, test_dataset):
                         loss.sum().backward()
                         # update weights
                         optim.step()
+                        wandb.log({"train_loss": loss.item()})
 
                     with record_function("update_info"):
                         # print progress
@@ -233,6 +261,7 @@ def main(rank, train_dataset, test_dataset):
                             loss=loss.sum()
                             # acc=float(acc)
                         )
+            logger.dumpkvs()
 
             # Epoch finish up steps
             if rank==0:
@@ -257,20 +286,37 @@ def main(rank, train_dataset, test_dataset):
                             'optimizer_state_dict': optim.state_dict(),
                             'loss': loss.sum(),
                             }, f"./checkpoints/SparseAutoEnc_{model_name}_epochs_{epoch}.pt")
+                try:
+                    pathlib.Path.unlink(f"./checkpoints/SparseAutoEnc_{model_name}_epochs_{epoch-1}.pt")
+                except OSError as e:
+                    continue
 
     if multi_gpu:
         torch.distributed.destroy_process_group()
 
 
+
 if __name__ == '__main__':
     import torch.multiprocessing as mp
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--batch_size', dest='batch_size', type=int, help='specify batch size')
+    args = parser.parse_args()
+    batch_size = args.batch_size
+    if batch_size is None:
+        batch_size = 1
+    print ("--- Using batch size: ", batch_size)
     print("--- Main thread. World Size: ", WORLD_SIZE)
+
+
+
     prompts = load_data()
     train_dataset, test_dataset = prep_data(prompts)
     if WORLD_SIZE > 1:
-        mp.spawn(main, args=(train_dataset, test_dataset), nprocs=WORLD_SIZE) #, join=True)
+        mp.spawn(main, args=(batch_size, train_dataset, test_dataset), nprocs=WORLD_SIZE) #, join=True)
     else:
-        main(0, train_dataset, test_dataset)
+        main(0, batch_size, train_dataset, test_dataset)
 
 
 # prompts = load_data()
