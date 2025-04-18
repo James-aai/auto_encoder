@@ -21,11 +21,11 @@ multi_gpu = (len(gpus) > 1)
 # batch_size = 1 * len(gpus)
 learning_rate = 5e-5
 row_limit = 256000 # data row size
-epochs = 10
+epochs = 20
 epoch_start = 0
 WORLD_SIZE = len(gpus) #torch.cuda.device_count()
 embed_dim = 1000
-sparsity_k = 100
+sparsity_k = 300
 sequence_token_length = 100
 load_checkpoint = False
 
@@ -280,14 +280,14 @@ def main(rank, batch_size, train_dataset, test_dataset):
                 # print(prof.key_averages(group_by_input_shape=True).table(sort_by="cuda_time_total", row_limit=10))
 
                 print("Saving model... ")
-                torch.save({
+                try:
+                    torch.save({
                             'epoch': epochs,
                             'model_state_dict': model.state_dict(),
                             'optimizer_state_dict': optim.state_dict(),
                             'loss': loss.sum(),
                             }, f"./checkpoints/SparseAutoEnc_{model_name}_epochs_{epoch}.pt")
-                try:
-                    pathlib.Path.unlink(f"./checkpoints/SparseAutoEnc_{model_name}_epochs_{epoch-1}.pt")
+                    pathlib.Path.unlink(f"./checkpoints/SparseAutoEnc_{model_name}_epochs_{epoch-1}_emb_{embed_dim}_k_{sparsity_k}.pt")
                 except OSError as e:
                     continue
 
