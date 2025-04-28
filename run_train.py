@@ -2,10 +2,11 @@
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from dataclasses import dataclass
-import os
+import os, sys
 import pandas as pd
 # from models import gpt2_autoenc as model_def ## non-sparse
 from models import llama3_1_SAE as model_def
+# from models import gpt2_SAE as model_def
 import wandb
 import pathlib
 
@@ -21,12 +22,12 @@ multi_gpu = (len(gpus) > 1)
 # batch_size = 1 * len(gpus)
 learning_rate = 5e-5
 row_limit = 256000 # data row size
-epochs = 20
+epochs = 40
 epoch_start = 0
 WORLD_SIZE = len(gpus) #torch.cuda.device_count()
 embed_dim = 1000
-sparsity_k = 300
-sequence_token_length = 100
+sparsity_k = 100
+sequence_token_length = 300
 load_checkpoint = False
 
 print( "GPUs Available: ", len(gpus),
@@ -119,8 +120,9 @@ def test_example(model, text):
 
 def test_example_print(model, text_ids):
     result, text_str = test_example(model, text_ids)
-    print(f"Input: {text_str}")
-    print(f"Result: {result}")
+    with open("log_tests.txt", "a"):
+        print(f"Input: {text_str}")
+        print(f"Result: {result}")
 
 
 from tqdm import tqdm
@@ -265,6 +267,8 @@ def main(rank, batch_size, train_dataset, test_dataset):
 
             # Epoch finish up steps
             if rank==0:
+                with open("log_tests.txt", "a"):
+                    print(f"--- Tests following epoch {epoch} ---")
                 test_example_print(model, text_ids=test_dataset[0])
                 test_example_print(model, text_ids=test_dataset[1])
                 test_example_print(model, text_ids=test_dataset[2])
@@ -273,7 +277,8 @@ def main(rank, batch_size, train_dataset, test_dataset):
                     result, target = test_example(model, test_dataset[i])
                     val_metric.update(input=result, target=target)
 
-                print(f"Word Error rate = {val_metric.compute()}")
+                with open("log_tests.txt", "a"):
+                    print(f"Word Error rate = {val_metric.compute()}")
 
                 # print(prof.key_averages(group_by_input_shape=True).table()) #sort_by="cpu_time_total", row_limit=10))
                 # prof.export_chrome_trace("~/chrom.trace")
