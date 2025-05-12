@@ -2,7 +2,7 @@
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from dataclasses import dataclass
-import os, sys
+import os, sys, socket
 import pandas as pd
 # from models import gpt2_autoenc as model_def ## non-sparse
 # from models import llama3_1_SAE as model_def
@@ -16,7 +16,7 @@ from torch.optim import AdamW as optimiser_class
 from contextlib import redirect_stdout
 import wandb
 import pathlib
-from contextlib import nullcontext
+from contextlib import nullcontext, redirect_stdout
 
 os.environ["CUDA_VISIBLE_DEVICES"]="0,1"
 # os.environ["CUDA_VISIBLE_DEVICES"]="1"
@@ -30,7 +30,7 @@ gpus = [ 0 ]
 multi_gpu = (len(gpus) > 1)
 # batch_size = 1 * len(gpus)
 learning_rate = 5e-5 * 10
-row_limit = 100 # data row size. null = all data. 260,000 is most of it
+row_limit = 1000 # data row size. null = all data. 260,000 is most of it
 epochs = 10
 steps_per_update = 1
 default_batch_size = 10
@@ -40,26 +40,35 @@ embed_dim = 1000
 sparsity_k = 100
 sequence_token_length = 300
 load_checkpoint = False
-output_to_file = True
+print_output_to_file = True
+print_output_file_path = "./print_output/"
 use_profiler = False
 save_checkpoints = False
-experimen_name = "sparse-autoencoder-" + model_name + "-" + str(embed_dim) + "-" + str(sparsity_k)
-checkpoint_prefix = f"./checkpoints/{experimen_name}"
+checkpoint_path = "./checkpoints/"
+experiment_name = "sparse-autoencoder-" + model_name + "-" + str(embed_dim) + "-" + str(sparsity_k)
+checkpoint_prefix = f"{checkpoint_path}{experiment_name}"
 
-print( "GPUs Available: ", len(gpus),
-    [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())],
-)
+if not os.path.exists(print_output_file_path):
+    os.makedirs(print_output_file_path)
+
+if not os.path.exists(checkpoint_path):
+    os.makedirs(checkpoint_path)
+
+with open(print_output_file_path + "init.txt", "a+") if print_output_to_file else nullcontext() as f:
+    with redirect_stdout(f) if print_output_to_file else nullcontext():
+        print( "GPUs Available: ", len(gpus),
+            [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())],
+        )
 
 @dataclass
 class Config:
-    wandb_project: str | None = experimen_name
+    wandb_project: str | None = experiment_name
     wandb_name: str | None = "qsxim47qq-ppp"
-    # data_source_path: str = ("d:/@" if os.name == "nt" else "/") + "home/james/uni/phd/astro-ph-aic-cpt/data/*.parquet"
-    data_source_path: str = "/home/659/jm6832/data/astro-ph-aic-cpt/data"
+    data_source_path: str = ("/home/659/jm6832/data/astro-ph-aic-cpt/data" if "gadi" in socket.gethostname() else (
+            ("d:/@" if os.name == "nt" else "/") + "home/james/uni/phd/astro-ph-aic-cpt/data/*.parquet"))
     processed_file: str = "abstracts_tokens_" + model_name + ".pt"
 
 cfg = Config()
-
 
 def load_data():
     # print(f"----------Loading data from disc ----------")
@@ -71,7 +80,9 @@ def load_data():
     #     input_ids = torch.load(processed_file)
     # else:
     ## dataloading is left as an exercise for the reader
-    print("--- loading data from parquet files start... ---")
+    with open(print_output_file_path + "init.txt", "a+") if print_output_to_file else nullcontext() as f:
+        with redirect_stdout(f) if print_output_to_file else nullcontext():
+            print("--- loading data from parquet files start... ---")
     filelist = glob.glob(cfg.data_source_path)
     assert len(filelist) > 0
     filelist = [x.replace("\\", "/") for x in filelist]
@@ -101,7 +112,9 @@ class TextDataset(Dataset):
         return len(self.text['input_ids'])
 
 def prep_data(text):
-    print("----------Create train / test split and tokenize----------")
+    with open(print_output_file_path + "init.txt", "a+") if print_output_to_file else nullcontext() as f:
+        with redirect_stdout(f) if print_output_to_file else nullcontext():
+            print("----------Create train / test split and tokenize----------")
     from sklearn.model_selection import train_test_split
     prompts_train, prompts_test = train_test_split(text, test_size=.2)
 
@@ -169,10 +182,12 @@ def test_example(model, text):
     model.train()
     return result, text
 
-def test_example_print(model, text_ids):
+def test_example_print(model, text_ids, epoch):
     result, text_str = test_example(model, text_ids)
-    print(f"Input: {text_str}")
-    print(f"Result: {"".join(result.splitlines())}")
+    with open(print_output_file_path + f"e{epoch}.txt", "a+") if print_output_to_file else nullcontext() as f:
+        with redirect_stdout(f) if print_output_to_file else nullcontext():
+            print(f"Input: {text_str}")
+            print(f"Result: {"".join(result.splitlines())}")
 
 
 from tqdm import tqdm
@@ -228,18 +243,18 @@ def main(rank, batch_size, train_dataset, test_dataset):
     #if logger is None:
     logger = Logger(project=f"sparse-autoenc-{model_name}-emb-{embed_dim}-k-{sparsity_k}")
 
-    with torch.profiler.profile(
+    with (torch.profiler.profile(
             schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=1),
             on_trace_ready=torch.profiler.tensorboard_trace_handler(F'./log/{model_name}_sparseautoenc'),
             record_shapes=True,
             profile_memory=True,
             with_stack=True
-    ) if use_profiler else nullcontext() as prof:
+    ) if use_profiler else nullcontext() as prof):
 
         model = model_def.SparseAutoEnc(rank, sequence_token_length, embed_dim, sparsity_k)
         optim = optimiser_class(model.parameters(), lr=learning_rate)
-        epoch_start = 0
         update_step_counter = 0
+        epoch_start = 0
 
         if load_checkpoint:
             ## find the file matching checkpoint prefix with the highest epoch number
@@ -278,84 +293,90 @@ def main(rank, batch_size, train_dataset, test_dataset):
         # torch.cuda.memory._record_memory_history()
 
         for epoch in range(epoch_start, epoch_start + epochs):
-            print("Starting epoch: ", epoch)
-            if multi_gpu:
-                sampler_train.set_epoch(epoch)
-            # with profile(activities=[ProfilerActivity.CUDA], record_shapes=True) as prof:
 
-            with progress_bar(train_loader) as batches:
-                batches.set_description(f"Epoch {epoch}")
-                for batch in batches:
-                    if use_profiler:
-                        prof.step()
-                    # with torch.amp.autocast(device_type="cuda"):
-                    with record_function("data_loading") if use_profiler else nullcontext():
-                        input_ids = batch['input_ids'].to(rank)
-                        attention_mask = batch['attention_mask'].to(rank)
-                        labels = batch['labels'].to(rank)
-                    # forward pass
-                    with record_function("forward_pass") if use_profiler else nullcontext():
-                        outputs = model(input_ids, attention_mask=attention_mask, labels=labels)
+            with open(print_output_file_path + f"e{epoch}.txt", "a+") if rank == 0 and print_output_to_file else nullcontext() as f:
+                with redirect_stdout(f) if rank == 0 and print_output_to_file else nullcontext():
+                    if rank == 0:
+                        print("Starting epoch: ", epoch)
+                    if multi_gpu:
+                        sampler_train.set_epoch(epoch)
+                    # with profile(activities=[ProfilerActivity.CUDA], record_shapes=True) as prof:
 
-                    # torch.cuda.memory._dump_snapshot("my_snapshot.pickle")
+                    with progress_bar(train_loader) as batches:
+                        batches.set_description(f"Epoch {epoch}")
+                        for batch in batches:
+                            if use_profiler:
+                                prof.step()
+                            # with torch.amp.autocast(device_type="cuda"):
+                            with record_function("data_loading") if use_profiler else nullcontext():
+                                input_ids = batch['input_ids'].to(rank)
+                                attention_mask = batch['attention_mask'].to(rank)
+                                labels = batch['labels'].to(rank)
+                            # forward pass
+                            with record_function("forward_pass") if use_profiler else nullcontext():
+                                outputs = model(input_ids, attention_mask=attention_mask, labels=labels)
 
-                    with record_function("backward_pass") if use_profiler else nullcontext():
-                        loss = outputs #.cpu()
-                        update_step_counter += batch_size
-                        if update_step_counter >= steps_per_update:
-                            update_step_counter = 0
-                            optim.zero_grad()
-                            loss.backward()
-                            # update weights
-                            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
-                            optim.step()
-                            # optim.zero_grad()
-                        else:
-                            loss.backward()
-                            # update weights
-                            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
-                            optim.step()
-                        wandb.log({"train_loss": loss.item()})
+                            # torch.cuda.memory._dump_snapshot("my_snapshot.pickle")
 
-                    with record_function("update_info") if use_profiler else nullcontext():
-                        # print progress
-                        # metric.update(outputs[1], labels)
-                        # acc = (outputs.round() == labels).float().mean()
-                        batches.set_postfix(
-                            loss=loss.sum()
-                            # acc=float(acc)
-                        )
-            logger.dumpkvs()
+                            with record_function("backward_pass") if use_profiler else nullcontext():
+                                loss = outputs #.cpu()
+                                update_step_counter += batch_size
+                                if update_step_counter >= steps_per_update:
+                                    update_step_counter = 0
+                                    optim.zero_grad()
+                                    loss.backward()
+                                    # update weights
+                                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
+                                    optim.step()
+                                    # optim.zero_grad()
+                                else:
+                                    loss.backward()
+                                    # update weights
+                                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
+                                    optim.step()
+                                wandb.log({"train_loss": loss.item()})
 
-            # Epoch finish up steps
-            if rank==0:
-                plot_grad_flow(model.named_parameters())
-                test_example_print(model, text_ids=test_dataset[0])
-                test_example_print(model, text_ids=test_dataset[1])
-                test_example_print(model, text_ids=test_dataset[2])
-                test_example_print(model, text_ids=test_dataset[3])
-                for i in range(0,min(len(test_dataset), 30)):
-                    result, target = test_example(model, test_dataset[i])
-                    val_metric.update(input=result, target=target)
+                            with record_function("update_info") if use_profiler else nullcontext():
+                                # print progress
+                                # metric.update(outputs[1], labels)
+                                # acc = (outputs.round() == labels).float().mean()
+                                batches.set_postfix(
+                                    loss=loss.sum()
+                                    # acc=float(acc)
+                                )
+                    logger.dumpkvs()
 
-                print(f"Word Error rate = {val_metric.compute()}")
+                    # Epoch finish up steps
+                    if rank==0:
+                        plot_grad_flow(model.named_parameters())
+                        test_example_print(model, text_ids=test_dataset[0], epoch=epoch)
+                        test_example_print(model, text_ids=test_dataset[1], epoch=epoch)
+                        test_example_print(model, text_ids=test_dataset[2], epoch=epoch)
+                        test_example_print(model, text_ids=test_dataset[3], epoch=epoch)
+                        for i in range(0,min(len(test_dataset), 30)):
+                            result, target = test_example(model, test_dataset[i])
+                            val_metric.update(input=result, target=target)
 
-                # print(prof.key_averages(group_by_input_shape=True).table()) #sort_by="cpu_time_total", row_limit=10))
-                # prof.export_chrome_trace("~/chrom.trace")
-                # print(prof.key_averages(group_by_input_shape=True).table(sort_by="cuda_time_total", row_limit=10))
+                        with open(print_output_file_path + f"e{epoch}.txt", "a+") if print_output_to_file else nullcontext():
+                            print(f"Word Error rate = {val_metric.compute()}")
 
-                if save_checkpoints:
-                    print("Saving model... ")
-                    torch.save({
-                                'epoch': epochs,
-                                'model_state_dict': model.state_dict(),
-                                'optimizer_state_dict': optim.state_dict(),
-                                'loss': loss.sum(),
-                                }, f"{checkpoint_prefix}_epochs_{epoch}.pt")
-                    try:
-                        pathlib.Path.unlink(f"{checkpoint_prefix}_epochs_{epoch-1}.pt")
-                    except OSError as e:
-                        continue
+                        # print(prof.key_averages(group_by_input_shape=True).table()) #sort_by="cpu_time_total", row_limit=10))
+                        # prof.export_chrome_trace("~/chrom.trace")
+                        # print(prof.key_averages(group_by_input_shape=True).table(sort_by="cuda_time_total", row_limit=10))
+
+                        if save_checkpoints:
+                            with open(print_output_file_path + f"e{epoch}.txt", "a+") if print_output_to_file else nullcontext():
+                                print("Saving model... ")
+                            torch.save({
+                                        'epoch': epochs,
+                                        'model_state_dict': model.state_dict(),
+                                        'optimizer_state_dict': optim.state_dict(),
+                                        'loss': loss.sum(),
+                                        }, f"{checkpoint_prefix}_epochs_{epoch}.pt")
+                            try:
+                                pathlib.Path.unlink(f"{checkpoint_prefix}_epochs_{epoch-1}.pt")
+                            except OSError as e:
+                                continue
 
     if multi_gpu:
         torch.distributed.destroy_process_group()
@@ -372,8 +393,9 @@ if __name__ == '__main__':
     batch_size = args.batch_size
     if batch_size is None:
         batch_size = default_batch_size
-    print ("--- Using batch size: ", batch_size)
-    print("--- Main thread. World Size: ", WORLD_SIZE)
+    with open(print_output_file_path + "init.txt", "a+") if print_output_to_file else nullcontext():
+        print ("--- Using batch size: ", batch_size)
+        print("--- Main thread. World Size: ", WORLD_SIZE)
 
 
 
