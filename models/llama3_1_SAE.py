@@ -31,8 +31,8 @@ class SparseAutoEnc(torch.nn.Module):
         self.logit_dim = 3072  # 768 for GPT-2, 3072 for Llama 3.2
         self.sparse_act = torch.nn.ReLU()
         self.device_main = torch.device(f"cuda:{rank}")
-        # self.device_aux = torch.device("cuda:1")
-        self.device_aux = self.device_main
+        self.device_aux = torch.device("cuda:1")
+        # self.device_aux = self.device_main
 
         enc_model = self._load_model(rank)
         self.encoder_0 = list(enc_model.children())[0].to(self.device_main)

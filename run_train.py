@@ -2,32 +2,49 @@
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from dataclasses import dataclass
-import os
+import os, sys
 import pandas as pd
 # from models import gpt2_autoenc as model_def ## non-sparse
-from models import llama3_1_SAE as model_def
+# from models import llama3_1_SAE as model_def
+# from models import gpt2_SAE as model_def
+from models import gpt2_SAE_v2 as model_def
+# from models import bart_SAE as model_def
+
+from torch.optim import AdamW as optimiser_class
+# from torch.optim import SGD as optimiser_class
+
+from contextlib import redirect_stdout
 import wandb
 import pathlib
+from contextlib import nullcontext
 
 os.environ["CUDA_VISIBLE_DEVICES"]="0,1"
 # os.environ["CUDA_VISIBLE_DEVICES"]="1"
 os.environ["CUDA_LAUNCH_BLOCKING"]="1"
 os.environ["TOKENIZERS_PARALLELISM"]="true"
 os.environ["HF_TOKEN"] = "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"
+os.environ["WANDB_API_KEY"] = "5df70ce8ab7fcc1725fa5e5865f8eeed71514b09"
 
 model_name = model_def.model_id.split('/')[-1]
-gpus = [ 0 ]
+gpus = [ 0, 1]
 multi_gpu = (len(gpus) > 1)
 # batch_size = 1 * len(gpus)
-learning_rate = 5e-5
-row_limit = 256000 # data row size
+learning_rate = 5e-5 * 10
+row_limit = 100 # data row size. null = all data. 260,000 is most of it
 epochs = 10
+steps_per_update = 1
+default_batch_size = 10
 epoch_start = 0
 WORLD_SIZE = len(gpus) #torch.cuda.device_count()
 embed_dim = 1000
 sparsity_k = 100
-sequence_token_length = 100
+sequence_token_length = 300
 load_checkpoint = False
+output_to_file = True
+use_profiler = False
+save_checkpoints = False
+experimen_name = "sparse-autoencoder-" + model_name + "-" + str(embed_dim) + "-" + str(sparsity_k)
+checkpoint_prefix = f"./checkpoints/{experimen_name}"
 
 print( "GPUs Available: ", len(gpus),
     [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())],
@@ -35,10 +52,10 @@ print( "GPUs Available: ", len(gpus),
 
 @dataclass
 class Config:
-    wandb_project: str | None = "sparse-autoencoder-" + model_name + "-" + str(embed_dim) + "-" + str(sparsity_k)
+    wandb_project: str | None = experimen_name
     wandb_name: str | None = "qsxim47qq-ppp"
-    # data_source_path: str = ("d:/@" if os.name == "nt" else "/") + "home/james/uni/phd/astro-ph-aic-cpt/data/*.parquet"
-    data_source_path: str = "/home/659/jm6832/data/astro-ph-aic-cpt/data"
+    data_source_path: str = ("d:/@" if os.name == "nt" else "/") + "home/james/uni/phd/astro-ph-aic-cpt/data/*.parquet"
+    # data_source_path: str = "/home/659/jm6832/data/astro-ph-aic-cpt/data"
     processed_file: str = "abstracts_tokens_" + model_name + ".pt"
 
 cfg = Config()
@@ -99,6 +116,41 @@ def prep_data(text):
     print("Done!")
     return train_tokens, test_tokens
 
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+import numpy as np
+def plot_grad_flow(named_parameters):
+    '''Plots the gradients flowing through different layers in the net during training.
+    Can be used for checking for possible gradient vanishing / exploding problems.
+
+    Usage: Plug this function in Trainer class after loss.backwards() as
+    "plot_grad_flow(self.model.named_parameters())" to visualize the gradient flow'''
+    ave_grads = []
+    max_grads = []
+    layers = []
+    for n, p in named_parameters:
+        if (p.requires_grad) and ("bias" not in n) and p.grad is not None:
+            layers.append(n)
+            ave_grad = p.grad.abs().mean().cpu()
+            max_grad = p.grad.abs().max().cpu()
+            print(f"Layer {n} with average grad {ave_grad:.5f} and max_grad {max_grad:.5f}")
+            ave_grads.append(ave_grad)
+            max_grads.append(max_grad)
+    plt.bar(np.arange(len(max_grads)), max_grads, alpha=0.1, lw=1, color="c")
+    plt.bar(np.arange(len(max_grads)), ave_grads, alpha=0.1, lw=1, color="b")
+    plt.hlines(0, 0, len(ave_grads) + 1, lw=2, color="k")
+    plt.xticks(range(0, len(ave_grads), 1), layers, rotation="vertical")
+    plt.autoscale(enable=True, axis='x', tight=True)
+    plt.xlim(left=0, right=len(ave_grads))
+    plt.ylim(bottom=-0.001, top=0.02)  # zoom in on the lower gradient regions
+    plt.xlabel("Layers")
+    plt.ylabel("average gradient")
+    plt.title("Gradient flow")
+    plt.grid(True)
+    plt.legend([Line2D([0], [0], color="c", lw=4),
+                Line2D([0], [0], color="b", lw=4),
+                Line2D([0], [0], color="k", lw=4)], ['max-gradient', 'mean-gradient', 'zero-gradient'])
+    plt.show()
 
 def test_example(model, text):
     model.eval()
@@ -120,7 +172,7 @@ def test_example(model, text):
 def test_example_print(model, text_ids):
     result, text_str = test_example(model, text_ids)
     print(f"Input: {text_str}")
-    print(f"Result: {result}")
+    print(f"Result: {"".join(result.splitlines())}")
 
 
 from tqdm import tqdm
@@ -150,7 +202,6 @@ def main(rank, batch_size, train_dataset, test_dataset):
     print(f"----training process started for model {model_name} on GPU: {rank}")
     import torch
     from torch.utils.data import DataLoader
-    from torch.optim import AdamW
     from torch.utils.data.distributed import DistributedSampler
     from torch.profiler import profile, record_function, ProfilerActivity
 
@@ -183,15 +234,16 @@ def main(rank, batch_size, train_dataset, test_dataset):
             record_shapes=True,
             profile_memory=True,
             with_stack=True
-    ) as prof:
+    ) if use_profiler else nullcontext() as prof:
 
-        # model = model_def.AutoEnc(rank, sequence_token_length, embed_dim)
         model = model_def.SparseAutoEnc(rank, sequence_token_length, embed_dim, sparsity_k)
-        # optim = AdamW(model.parameters(), lr=learning_rate)
-        optim = torch.optim.SGD(model.parameters(), lr=learning_rate)
+        optim = optimiser_class(model.parameters(), lr=learning_rate)
         epoch_start = 0
+        update_step_counter = 0
 
         if load_checkpoint:
+            ## find the file matching checkpoint prefix with the highest epoch number
+            # os.find(checkpoint_prefix)
             checkpoint = torch.load(f"./checkpoints/SparseAutoEnc_{model_name}_tokens_{sequence_token_length}.pt", weights_only=True)
             model.load_state_dict(checkpoint['model_state_dict'])
             optim.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -200,6 +252,7 @@ def main(rank, batch_size, train_dataset, test_dataset):
 
         torch.cuda.set_device(rank)
         model.train()
+        optim.zero_grad()
 
         # validation metric
         from torcheval.metrics import WordErrorRate
@@ -233,27 +286,38 @@ def main(rank, batch_size, train_dataset, test_dataset):
             with progress_bar(train_loader) as batches:
                 batches.set_description(f"Epoch {epoch}")
                 for batch in batches:
-                    prof.step()
+                    if use_profiler:
+                        prof.step()
                     # with torch.amp.autocast(device_type="cuda"):
-                    with record_function("data_loading"):
+                    with record_function("data_loading") if use_profiler else nullcontext():
                         input_ids = batch['input_ids'].to(rank)
                         attention_mask = batch['attention_mask'].to(rank)
                         labels = batch['labels'].to(rank)
                     # forward pass
-                    with record_function("forward_pass"):
-                            outputs = model(input_ids, attention_mask=attention_mask, labels=labels)
+                    with record_function("forward_pass") if use_profiler else nullcontext():
+                        outputs = model(input_ids, attention_mask=attention_mask, labels=labels)
 
                     # torch.cuda.memory._dump_snapshot("my_snapshot.pickle")
 
-                    with record_function("backward_pass"):
+                    with record_function("backward_pass") if use_profiler else nullcontext():
                         loss = outputs #.cpu()
-                        optim.zero_grad()
-                        loss.sum().backward()
-                        # update weights
-                        optim.step()
+                        update_step_counter += batch_size
+                        if update_step_counter >= steps_per_update:
+                            update_step_counter = 0
+                            optim.zero_grad()
+                            loss.backward()
+                            # update weights
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
+                            optim.step()
+                            # optim.zero_grad()
+                        else:
+                            loss.backward()
+                            # update weights
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
+                            optim.step()
                         wandb.log({"train_loss": loss.item()})
 
-                    with record_function("update_info"):
+                    with record_function("update_info") if use_profiler else nullcontext():
                         # print progress
                         # metric.update(outputs[1], labels)
                         # acc = (outputs.round() == labels).float().mean()
@@ -265,6 +329,7 @@ def main(rank, batch_size, train_dataset, test_dataset):
 
             # Epoch finish up steps
             if rank==0:
+                plot_grad_flow(model.named_parameters())
                 test_example_print(model, text_ids=test_dataset[0])
                 test_example_print(model, text_ids=test_dataset[1])
                 test_example_print(model, text_ids=test_dataset[2])
@@ -279,17 +344,18 @@ def main(rank, batch_size, train_dataset, test_dataset):
                 # prof.export_chrome_trace("~/chrom.trace")
                 # print(prof.key_averages(group_by_input_shape=True).table(sort_by="cuda_time_total", row_limit=10))
 
-                print("Saving model... ")
-                torch.save({
-                            'epoch': epochs,
-                            'model_state_dict': model.state_dict(),
-                            'optimizer_state_dict': optim.state_dict(),
-                            'loss': loss.sum(),
-                            }, f"./checkpoints/SparseAutoEnc_{model_name}_epochs_{epoch}.pt")
-                try:
-                    pathlib.Path.unlink(f"./checkpoints/SparseAutoEnc_{model_name}_epochs_{epoch-1}.pt")
-                except OSError as e:
-                    continue
+                if save_checkpoints:
+                    print("Saving model... ")
+                    torch.save({
+                                'epoch': epochs,
+                                'model_state_dict': model.state_dict(),
+                                'optimizer_state_dict': optim.state_dict(),
+                                'loss': loss.sum(),
+                                }, f"{checkpoint_prefix}_epochs_{epoch}.pt")
+                    try:
+                        pathlib.Path.unlink(f"{checkpoint_prefix}_epochs_{epoch-1}.pt")
+                    except OSError as e:
+                        continue
 
     if multi_gpu:
         torch.distributed.destroy_process_group()
@@ -305,7 +371,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
     batch_size = args.batch_size
     if batch_size is None:
-        batch_size = 1
+        batch_size = default_batch_size
     print ("--- Using batch size: ", batch_size)
     print("--- Main thread. World Size: ", WORLD_SIZE)
 
