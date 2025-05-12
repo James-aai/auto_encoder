@@ -26,7 +26,7 @@ os.environ["HF_TOKEN"] = "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"
 os.environ["WANDB_API_KEY"] = "5df70ce8ab7fcc1725fa5e5865f8eeed71514b09"
 
 model_name = model_def.model_id.split('/')[-1]
-gpus = [ 0, 1]
+gpus = [ 0 ]
 multi_gpu = (len(gpus) > 1)
 # batch_size = 1 * len(gpus)
 learning_rate = 5e-5 * 10
@@ -54,8 +54,8 @@ print( "GPUs Available: ", len(gpus),
 class Config:
     wandb_project: str | None = experimen_name
     wandb_name: str | None = "qsxim47qq-ppp"
-    data_source_path: str = ("d:/@" if os.name == "nt" else "/") + "home/james/uni/phd/astro-ph-aic-cpt/data/*.parquet"
-    # data_source_path: str = "/home/659/jm6832/data/astro-ph-aic-cpt/data"
+    # data_source_path: str = ("d:/@" if os.name == "nt" else "/") + "home/james/uni/phd/astro-ph-aic-cpt/data/*.parquet"
+    data_source_path: str = "/home/659/jm6832/data/astro-ph-aic-cpt/data"
     processed_file: str = "abstracts_tokens_" + model_name + ".pt"
 
 cfg = Config()
